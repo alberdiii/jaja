@@ -213,7 +213,7 @@ class Roblox:
                 if self.ctype == "Email" and "Received credentials belong to multiple accounts" in response.text:
                     Output("SUCCESS").log(f"Valid account | {self.account[0]}")
 
-                    self.handle_multi(user_id_and_cookie)
+                    self.handle_multi(response.json())
 
                     self.checked = True
 
